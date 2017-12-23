@@ -28,24 +28,26 @@ namespace {
     return transformed_ob;
   }
 
-  LandmarkObs findClosestObservationAroundLandmark(const Map::single_landmark_s& landmark,
-                                                   const vector<LandmarkObs>& observations) {
+  int findClosestLandmarkAroundWorldObservation(const Map& map,
+                                                const LandmarkObs& world_observation,
+                                                double dist_limit) {
+    // We will ignore landmarks that are over dist_limit away from world_observation
     double min_dist = numeric_limits<double>::infinity();
-    int ob_index = 0;
-    for (auto i = 0; i < observations.size(); ++i) {
-      const auto ob = observations[i];
-      auto dist = dist(landmark.x_f, landmark.y_f, ob.x, ob.y);
-      if (dist < min_dist) {
-        min_dist = dist;
-        ob_index = i;
+    int landmark_index = 0;
+    for (auto i = 0; i < map.landmark_list.size(); ++i) {
+      const auto landmark = map.landmark_list[i];
+      auto d = dist(landmark.x_f, landmark.y_f, world_observation.x, world_observation.y);
+      if (d < dist_limit && d < min_dist) {
+        min_dist = d;
+        landmark_index = i;
       }
     }
-    return observations[ob_index];
+    return landmark_index;
   }
 
   double getMaxParticleWeight(const vector<Particle> particles) {
     double max_weight = 0;
-    for (auto particle : particles) {
+    for (const auto& particle : particles) {
       max_weight = max(max_weight, particle.weight);
     }
     return max_weight;
@@ -58,7 +60,7 @@ void ParticleFilter::init(double x, double y, double theta, double std[]) {
   // Add random Gaussian noise to each particle.
   // NOTE: Consult particle_filter.h for more information about this method (and others in this file).
 
-  num_particles = 100;
+  num_particles = 1000;
 
   auto x_std = std[0];
   auto y_std = std[1];
@@ -80,6 +82,8 @@ void ParticleFilter::init(double x, double y, double theta, double std[]) {
     p.weight = 1.0;
     particles.push_back(p);
   }
+
+  is_initialized = true;
 }
 
 void ParticleFilter::prediction(double delta_t,
@@ -101,15 +105,26 @@ void ParticleFilter::prediction(double delta_t,
   normal_distribution<double> y_dist(0, y_std);
   normal_distribution<double> theta_dist(0, theta_std);
 
-  for (auto particle : particles) {
+  for (auto& particle : particles) {
     auto x = particle.x;
     auto y = particle.y;
     auto theta = particle.theta;
 
-    auto x_pred = x + velocity / yaw_rate * (sin(theta + yaw_rate * delta_t) - sin(theta));
-    auto y_pred = y + velocity / yaw_rate * (cos(theta) - cos(theta + yaw_rate * delta_t));
-    auto theta_pred = theta + yaw_rate * delta_t;
+    // REMEMBER! For predicting x & y, you need to treat it different when the yaw rate is near
+    // zero or not!
+    double x_pred, y_pred;
+    if (abs(yaw_rate) > 0.001) {
+      x_pred = x + velocity / yaw_rate * (sin(theta + yaw_rate * delta_t) - sin(theta));
+      y_pred = y + velocity / yaw_rate * (cos(theta) - cos(theta + yaw_rate * delta_t));
+    } else {
+      x_pred = x + velocity * cos(theta) * delta_t;
+      y_pred = y + velocity * sin(theta) * delta_t;
+    }
 
+    double theta_pred = theta + yaw_rate * delta_t;
+
+    // Don't forget to add noise (if you use noise of x, y and yaw rate, the noise is additive.
+    // But if you use noise of longitudinal acceleration or yaw dot dot, the noise isn't additive)
     x_pred += x_dist(gen);
     y_pred += y_dist(gen);
     theta_pred += theta_dist(gen);
@@ -137,20 +152,32 @@ void ParticleFilter::updateWeights(double sensor_range,
   const double landmark_std_x = std_landmark[0];
   const double landmark_std_y = std_landmark[1];
 
-  for(auto particle : particles) {
-    vector<LandmarkObs> world_obs;
-    for (auto i = 0; i < observations.size(); ++i) {
-      // Transform each landmark observation from car coordinates into world coordinates (called
-      // world observation)
-      auto world_ob = transformObservation(observations[i], particle.x, particle.y, particle.theta);
-      world_obs.push_back(world_ob);
+  // We will re-evaluate weight for each particle
+  for(auto& particle : particles) {
+
+    // Based the current particle (i.e., one of predicted car pose), transform each landmark
+    // observation from car coordinates into world coordinates (called world observation)
+    vector<LandmarkObs> world_observations;
+    for (const auto& observation : observations) {
+      auto world_observation = transformObservation(observation, particle.x, particle.y,
+                                                    particle.theta);
+      world_observations.push_back(world_observation);
     }
-    for (auto landmark : map_landmarks.landmark_list) {
-      auto closest_ob = findClosestObservationAroundLandmark(landmark, world_obs);
-      particle.weight *= 1.0 / (2 * M_PI * landmark_std_x * landmark_std_y)
-          * exp(-((closest_ob.x - landmark.x_f) * (closest_ob.x - landmark.x_f) / (2.0 * landmark_std_x * landmark_std_x)
-                + (closest_ob.y - landmark.y_f) * (closest_ob.y - landmark.y_f) / (2.0 * landmark_std_y * landmark_std_y)));
+
+    // For each world observation, find the closest landmark, and calculate the probability of
+    // getting this world observation for that landmark
+    double new_weight = 1.0;
+    for (auto world_observation : world_observations) {
+      auto landmark_index = findClosestLandmarkAroundWorldObservation(map_landmarks,
+                                                                      world_observation,
+                                                                      sensor_range);
+      const auto landmark = map_landmarks.landmark_list[landmark_index];
+
+      new_weight *= 1.0 / (2 * M_PI * landmark_std_x * landmark_std_y)
+          * exp(-(pow(world_observation.x - landmark.x_f, 2) / (2.0 * pow(landmark_std_x, 2))
+                + pow(world_observation.y - landmark.y_f, 2) / (2.0 * pow(landmark_std_y, 2))));
     }
+    particle.weight = new_weight;
   }
 }
 
@@ -165,10 +192,10 @@ void ParticleFilter::resample() {
   vector<Particle> new_particles;
 
   // Resampling roulette (wheel) algorithm
-  int index = static_cast<int>(uniform_dist(gen) * num_particles);
+  auto index = static_cast<int>(uniform_dist(gen) * num_particles);
   double beta = 0.0;
   double max_weight = getMaxParticleWeight(particles);
-  for (auto particle : particles) {
+  for (const auto& particle : particles) {
     beta += uniform_dist(gen) * 2.0 * max_weight;
     while (beta > particles[index].weight) {
       beta -= particles[index].weight;
